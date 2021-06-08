@@ -1,0 +1,123 @@
+---
+- name: Set the region format to English United States
+  win_region:
+    format: en-US
+- name: Set timezone to Central Time
+  win_timezone:
+    timezone: Central Standard Time
+- name: Check CDROM Drive Letters
+  win_shell: |
+    (Get-WmiObject -Class Win32_volume -Filter {DriveType = 5 and DriveLetter != "Z:"} | Measure-Object) | ConvertTo-Json
+  register: cdromCountResults
+  changed_when: (cdromCountResults.stdout | from_json)["Count"] > 0
+- name: Set CDROM Drive Letter
+  win_shell: |
+    $usabledrivelettersbackwards = @('Z:','Y:','X:','W:','V:','U:','T:','S:','R:','Q:','O:','N:','M:','L:','K:','J:','I:')
+    $vols = Get-WmiObject -Class Win32_volume -Filter {DriveType = 5 and DriveLetter != "Z:"}
+    foreach($vol in $vols)
+    {
+        $iSelected = -1
+        for($i=0;$i -lt $usabledrivelettersbackwards.Count; $i++)
+        {
+            if(((Get-WmiObject -Class Win32_volume -Filter "DriveLetter = '$($usabledrivelettersbackwards[$i])'" | Measure-Object).Count) -eq 0)
+            {
+                $iSelected = $i
+                break
+            }
+        }
+        $driveletter = $usabledrivelettersbackwards[$iSelected]
+        $result = ($vol | Set-WmiInstance -Arguments @{DriveLetter="$($driveletter)"}).DriveLetter -eq $driveletter
+    }
+  when: (cdromCountResults.stdout | from_json)["Count"] > 0
+- name: Change the hostname
+  win_hostname:
+    name: "{{ hostname }}"
+  register: res
+- name: Setup Automation User
+  block:
+    - name: Create Automation User
+      win_user:
+        name: "{{ passed_username }}"
+        password: "{{ passed_password }}"
+        password_never_expires: yes
+        state: present
+        groups:
+          - Administrators
+    - name: Hide Automation User
+      win_regedit:
+        path: HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList
+        name: "{{ passed_username }}"
+        data: 0
+        type: dword
+  when: passed_username is defined
+- name: Check Windows Activation Status
+  win_shell: |
+    try {
+        $wpa = Get-WmiObject SoftwareLicensingProduct -Filter "ApplicationID = '55c92734-d682-4d71-983e-d6ec3f16059f'" -Property LicenseStatus -ErrorAction Stop
+    }
+    catch {
+        $status = New-Object ComponentModel.Win32Exception ($_.Exception.ErrorCode)
+        $wpa = $null 
+    }
+    $out = [string]::Empty;
+    if ($wpa) {
+        :outer foreach ($item in $wpa) {
+            switch ($item.LicenseStatus) {
+                0 { $out = "Unlicensed" }
+                1 { $out = "Licensed"; break outer }
+                2 { $out = "Out-Of-Box Grace Period"; break outer }
+                3 { $out = "Out-Of-Tolerance Grace Period"; break outer }
+                4 { $out = "Non-Genuine Grace Period"; break outer }
+                5 { $out = "Notification"; break outer }
+                6 { $out = "Extended Grace"; break outer }
+                default { $out = "Unknown value" }
+            }
+        }
+    } else { $out = $status.Message }
+    Write-Output $out
+  register: windowsactivationstatus
+  changed_when: (windowsactivationstatus.stdout | trim) != "Licensed"
+  when: passed_activation_key is defined
+- name: Activate Windows
+  win_shell: |
+    $key = "{{ passed_activation_key }}"
+    $serviceSLS = Get-WMIObject -Query "select * from SoftwareLicensingService"
+    $install = $serviceSLS.InstallProductKey($key)
+    $refresh = $serviceSLS.RefreshLicenseStatus()
+    Start-Sleep -s 15
+    try {
+        $wpa = Get-WmiObject SoftwareLicensingProduct -Filter "ApplicationID = '55c92734-d682-4d71-983e-d6ec3f16059f'" -Property LicenseStatus -ErrorAction Stop
+    }
+    catch {
+        $status = New-Object ComponentModel.Win32Exception ($_.Exception.ErrorCode)
+        $wpa = $null 
+    }
+    $out = [string]::Empty;
+    if ($wpa) {
+        :outer foreach ($item in $wpa) {
+            switch ($item.LicenseStatus) {
+                0 { $out = "Unlicensed" }
+                1 { $out = "Licensed"; break outer }
+                2 { $out = "Out-Of-Box Grace Period"; break outer }
+                3 { $out = "Out-Of-Tolerance Grace Period"; break outer }
+                4 { $out = "Non-Genuine Grace Period"; break outer }
+                5 { $out = "Notification"; break outer }
+                6 { $out = "Extended Grace"; break outer }
+                default { $out = "Unknown value" }
+            }
+        }
+    } else { $out = $status.Message }
+    Write-Output $out
+  when: passed_activation_key is defined and (windowsactivationstatus.stdout | trim) != "Licensed"
+  register: windowsactivate
+  failed_when: (windowsactivate.stdout | trim) != "Licensed"
+- name: Reboot for hostname update
+  win_reboot:
+  when: res.reboot_required
+- name: Install all security, critical, and rollup updates
+  win_updates:
+    category_names:
+      - SecurityUpdates
+      - CriticalUpdates
+      - UpdateRollups
+    reboot: yes
